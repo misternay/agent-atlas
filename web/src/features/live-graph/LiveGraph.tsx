@@ -1,8 +1,9 @@
-import { Background, Controls, MiniMap, ReactFlow, type Edge, type Node, type ReactFlowInstance } from '@xyflow/react'
+import { Background, Controls, MiniMap, Position, ReactFlow, type Edge, type Node, type ReactFlowInstance } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../../state/store'
 import { buildGraph, type GNode } from './buildGraph'
+import { edgeTypes, parallelOffsets } from './edges'
 import { layoutGraph, NODE_SIZE, type Positions } from './layout'
 import { nodeTypes } from './nodes'
 import { nowUs } from '../../format'
@@ -28,7 +29,6 @@ export function LiveGraph() {
   const [positions, setPositions] = useState<Positions>({})
   const layoutSeq = useRef(0)
   const lastLayout = useRef(0)
-  const pendingTimer = useRef<number | null>(null)
   const flow = useRef<ReactFlowInstance | null>(null)
 
   // Re-evaluate the live window every 2s even without new events.
@@ -42,18 +42,25 @@ export function LiveGraph() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [live, windowS, harness, workspace, search, selectedSession, expanded, tick],
   )
-  const structureKey = useMemo(() => JSON.stringify([graph.nodes.map((n) => n.id), graph.edges.map((e) => e.id)]), [graph])
+  const structureKey = useMemo(() => JSON.stringify([
+    graph.nodes.map((n) => n.id).sort(),
+    graph.edges.map((e) => e.id).sort(),
+  ]), [graph])
+
+  useEffect(() => () => { layoutSeq.current++ }, [])
 
   // Throttled ELK layout: recompute at most every 400ms, only when structure changes.
   useEffect(() => {
-    const seq = ++layoutSeq.current
     const run = () => {
+      const seq = ++layoutSeq.current
       lastLayout.current = Date.now()
       void layoutGraph(graph.nodes, graph.edges).then((p) => {
         if (seq !== layoutSeq.current) return
         setPositions(p)
         // Re-fit when the set of nodes changed (not on every status update).
-        window.requestAnimationFrame(() => flow.current?.fitView({ padding: 0.15, duration: 250, maxZoom: 1.2 }))
+        window.requestAnimationFrame(() => {
+          if (seq === layoutSeq.current) void flow.current?.fitView({ padding: 0.15, duration: 250, maxZoom: 1.2 })
+        })
       }).catch(() => {
         if (seq !== layoutSeq.current) return
         const rows: Record<string, number> = {}
@@ -67,45 +74,51 @@ export function LiveGraph() {
       })
     }
     const since = Date.now() - lastLayout.current
-    if (pendingTimer.current) window.clearTimeout(pendingTimer.current)
     if (since > 400) run()
-    else pendingTimer.current = window.setTimeout(run, 400 - since)
-    return () => {
-      layoutSeq.current++
-      if (pendingTimer.current) window.clearTimeout(pendingTimer.current)
+    else {
+      const timer = window.setTimeout(run, 400 - since)
+      return () => window.clearTimeout(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [structureKey])
 
   const nodes: Node[] = useMemo(
     () =>
-      graph.nodes.map((g) => ({
-        id: g.id,
-        type: g.type,
-        position: positions[g.id] ?? { x: 0, y: 0 },
-        data: { g },
-        // Fixed size = the size ELK laid out; content ellipsizes inside.
-        width: NODE_SIZE[g.type].w,
-        height: NODE_SIZE[g.type].h,
-        selected: !!selection && ((selection.kind === 'span' && g.spanId === selection.id) || (selection.kind === 'session' && g.type === 'session' && g.sessionId === selection.id) || (selection.kind === 'resource' && g.id === 'res:' + selection.id)),
-        style: positions[g.id] ? undefined : { opacity: 0 },
-      })),
+      graph.nodes.filter((g) => positions[g.id]).map((g): Node => {
+        const { w: width, h: height } = NODE_SIZE[g.type]
+        return {
+          id: g.id,
+          type: g.type,
+          position: positions[g.id],
+          data: { g },
+          width,
+          height,
+          // The cards have fixed geometry. Keep their anchors available on every refresh.
+          measured: { width, height },
+          handles: [
+            { id: null, type: 'target', position: Position.Left, x: 0, y: height / 2, width: 0, height: 0 },
+            { id: null, type: 'source', position: Position.Right, x: width, y: height / 2, width: 0, height: 0 },
+          ],
+          selected: !!selection && ((selection.kind === 'span' && g.spanId === selection.id) || (selection.kind === 'session' && g.type === 'session' && g.sessionId === selection.id) || (selection.kind === 'resource' && g.id === 'res:' + selection.id)),
+        }
+      }),
     [graph, positions, selection],
   )
-  const edges: Edge[] = useMemo(
-    () =>
-      graph.edges.map((e) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        label: e.relation === 'invokes' || e.relation === 'belongs_to' ? undefined : e.relation,
-        className: `edge-${e.evidence} rel-${e.relation}`,
-        style: edgeStyle[e.evidence],
-        animated: false,
-        data: { evidence: e.evidence },
-      })),
-    [graph],
-  )
+  const edges: Edge[] = useMemo(() => {
+    const positioned = graph.edges.filter((e) => positions[e.source] && positions[e.target])
+    const offsets = parallelOffsets(positioned)
+    return positioned.map((e) => ({
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      type: offsets.has(e.id) ? 'parallel' : 'default',
+      label: e.relation === 'invokes' || e.relation === 'belongs_to' ? undefined : e.relation,
+      className: `edge-${e.evidence} rel-${e.relation}`,
+      style: edgeStyle[e.evidence],
+      animated: false,
+      data: { evidence: e.evidence, offset: offsets.get(e.id) },
+    }))
+  }, [graph, positions])
 
   const onNodeClick = (_: unknown, n: Node) => {
     const g = (n.data as { g: GNode }).g
@@ -130,6 +143,7 @@ export function LiveGraph() {
         <ReactFlow
           nodes={nodes}
           edges={edges}
+          edgeTypes={edgeTypes}
           nodeTypes={nodeTypes}
           onNodeClick={onNodeClick}
           onPaneClick={() => select(null)}

@@ -86,6 +86,19 @@ try {
     return true;
   })()`))
   await send('Page.enable')
+  await send('Page.addScriptToEvaluateOnNewDocument', { source: `
+    const NativeResizeObserver = window.ResizeObserver;
+    window.ResizeObserver = class extends NativeResizeObserver {
+      constructor(callback) {
+        super((entries, observer) => {
+          const ready = window.atlasPauseNodeMeasurements
+            ? entries.filter(({ target }) => !target.classList.contains('react-flow__node'))
+            : entries;
+          if (ready.length) callback(ready, observer);
+        });
+      }
+    };
+  ` })
   await send('Page.navigate', { url: signIn })
   await until(() => evaluate("document.querySelector('.conn.ok')?.textContent === 'live'"))
   if (await evaluate('location.hash')) throw new Error('sign-in code remained in the address bar')
@@ -182,6 +195,72 @@ try {
     return observed?.textContent.includes('PreToolUse') && observed.textContent.includes('PostToolUse');
   })`))
   console.log('History, completed timeline span, OTLP download, Replay, and hook coverage passed')
+
+  await click('.tabs button', 'Live')
+  const edgeHook = (event) => execFileSync(join(binaries, 'atlas'), ['hook', '--harness', 'codex'], {
+    env: { ...process.env, ATLAS_HOME: home },
+    input: JSON.stringify({
+      session_id: 'edge-regression', turn_id: 't', cwd: '/workspace/edge-regression',
+      hook_event_name: event, tool_name: 'Bash', tool_use_id: 'read-write',
+      tool_input: { command: 'cat fixture.txt; touch fixture.txt' },
+      tool_response: { exit_code: 0 },
+    }),
+  })
+  const verifyResourceEdges = async () => {
+    const edges = await until(() => evaluate(`(() => {
+      const paths = ['reads', 'writes'].map((relation) => {
+        const edge = document.querySelector('.rel-' + relation);
+        const path = edge?.querySelector('.react-flow__edge-path');
+        if (!path) return null;
+        const label = edge.querySelector('.react-flow__edge-text');
+        return {
+          path: path.getAttribute('d'), label: label?.textContent,
+          labelY: label?.getBoundingClientRect().y,
+          length: path.getTotalLength(),
+        };
+      });
+      return paths.every(Boolean) && paths;
+    })()`))
+    if (edges[0].path === edges[1].path || !edges.every((edge) => edge.length > 0)) {
+      throw new Error('Read and write edges overlap or have no length')
+    }
+    if (edges[0].label !== 'reads' || edges[1].label !== 'writes' || edges[0].labelY === edges[1].labelY) {
+      throw new Error('Read and write edge labels overlap or are missing')
+    }
+  }
+  edgeHook('PreToolUse')
+  await verifyResourceEdges()
+  await until(() => evaluate(`(() => {
+    const id = Array.from(document.querySelectorAll('.session-row .mono'))
+      .find((el) => el.textContent === 'edge-reg');
+    if (!id) return false;
+    id.closest('button').click();
+    return true;
+  })()`))
+  await until(() => evaluate("document.querySelectorAll('.react-flow__edge-path').length === 3"))
+  await evaluate('window.atlasPauseNodeMeasurements = true')
+  edgeHook('PostToolUse')
+  await until(() => evaluate(`Array.from(document.querySelectorAll('.gn-tool.st-completed .gn-title')).some((el) => el.textContent.startsWith('Bash'))`))
+  const missingEdges = await evaluate(`new Promise((resolve) => {
+    const start = performance.now();
+    const check = () => {
+      const count = document.querySelectorAll('.react-flow__edge-path').length;
+      if (count !== 3) return resolve(count);
+      if (performance.now() - start >= 2100) return resolve(null);
+      requestAnimationFrame(check);
+    };
+    check();
+  })`)
+  if (missingEdges !== null) {
+    throw new Error('Live graph lost edges with node measurements paused: expected 3, got ' + missingEdges)
+  }
+  await evaluate('window.atlasPauseNodeMeasurements = false')
+  await verifyResourceEdges()
+  await evaluate('window.atlasGraphBeforeReload = true')
+  await send('Page.reload')
+  await until(() => evaluate("!window.atlasGraphBeforeReload && document.querySelector('.conn.ok')?.textContent === 'live'"))
+  await verifyResourceEdges()
+  console.log('Live graph edges survive status and timer updates with node measurements paused; resource edges stay distinct after reload')
 } finally {
   cdp?.close()
   for (const child of [chrome, atlas]) {
