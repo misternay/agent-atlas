@@ -1,0 +1,8 @@
+/bin/
+/web/node_modules/
+/web/dist/
+/web/*.tsbuildinfo
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
