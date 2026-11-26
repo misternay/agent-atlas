@@ -1,6 +1,6 @@
 # Agent Atlas readiness review
 
-Verification ran on 2026-11-26 on Apple M3 Pro, macOS arm64, with Go 1.27.4, Node 24.21.0, and pnpm 10.15.0. This workspace has no Git metadata, so the report identifies the working copy and commands rather than a commit.
+Verification ran on 2026-11-26 on Apple M3 Pro, macOS arm64, with Go 1.27.4, Node 24.21.0, and pnpm 10.15.0.
 
 ## Runtime verification
 
